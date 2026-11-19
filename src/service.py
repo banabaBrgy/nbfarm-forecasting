@@ -1,9 +1,11 @@
-"""Egg forecasting: 3-year archive + temperature (primary), legacy 7-day OLS kept."""
+"""Egg forecasting: ARIMA primary, 3-year archive alternative, legacy 7-day OLS kept."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 from typing import Any
+
+from statsmodels.tsa.arima.model import ARIMA
 
 from src.regression import fit_line, predict_y
 
@@ -14,6 +16,8 @@ DEFAULT_HISTORY_YEARS = 3
 DEFAULT_NEUTRAL_TEMP = 28.0
 DEFAULT_TEMP_SHIFT = 0.015
 DEFAULT_TEMP_SHIFT_CAP = 0.20
+ARIMA_ORDER = (2, 1, 1)
+ARIMA_MIN_POINTS = 30
 SIZE_KEYS = ("small", "medium", "large", "extra_large", "cracked")
 
 
@@ -236,6 +240,7 @@ def _predict_total_for_day(
     slope, intercept = fit_line(xs, ys)
     predicted = predict_y(slope, intercept, float(target.year))
     predicted = int(round(predicted / eggs_per_tray) * eggs_per_tray)
+    return predicted, slope, intercept, len(dated_samples)
     if predicted <= 0:
         avg = sum(ys) / len(ys)
         predicted = int(round(avg / eggs_per_tray) * eggs_per_tray)
@@ -251,10 +256,13 @@ def _predict_one_day(
     per_degree: float,
     cap: float,
     eggs_per_tray: int,
+    predicted_total: int | None = None,
 ) -> dict[str, Any]:
     dated = _same_calendar_dated_samples(archive, target, history_years)
     samples = [row for _, row in dated]
     predicted, slope, intercept, sample_days = _predict_total_for_day(dated, target, eggs_per_tray)
+    if predicted_total is not None:
+        predicted = int(round(max(0, predicted_total) / eggs_per_tray) * eggs_per_tray)
 
     base_mix = {key: 0.0 for key in SIZE_KEYS}
     if samples:
@@ -405,6 +413,146 @@ def run_archive_temperature_forecast(
     }
 
 
+def run_arima_temperature_forecast(
+    history: list[dict[str, Any]],
+    predict_dates: list[str] | None = None,
+    temperatures: dict[str, Any] | None = None,
+    history_years: int = DEFAULT_HISTORY_YEARS,
+    neutral_temperature: float = DEFAULT_NEUTRAL_TEMP,
+    temp_shift_per_degree: float = DEFAULT_TEMP_SHIFT,
+    temp_shift_cap: float = DEFAULT_TEMP_SHIFT_CAP,
+    eggs_per_tray: int = EGGS_PER_TRAY,
+    archive_start: str | None = None,
+    archive_end: str | None = None,
+) -> dict[str, Any]:
+    """Forecast total daily eggs with ARIMA(2,1,1), retaining historical size mix."""
+    archive = _clip_archive(_normalize_archive(history), archive_start, archive_end)
+    if not archive:
+        return {
+            "predicted_eggs": 0, "forecast_date": None, "labels": [],
+            "dates": [], "data": [], "series": [],
+            "sizes": {key: 0 for key in SIZE_KEYS}, "sample_days": 0,
+            "temperature": None, "model": "arima_2_1_1",
+            "history_years": history_years,
+            "error": "Need archive harvest rows with eggs.",
+        }
+
+    ordered_dates = sorted(archive)
+    values = [float(archive[key]["eggs"]) for key in ordered_dates]
+    if len(values) < 30:
+        return {
+            "predicted_eggs": 0, "forecast_date": None, "labels": [],
+            "dates": [], "data": [], "series": [],
+            "sizes": {key: 0 for key in SIZE_KEYS}, "sample_days": 0,
+            "temperature": None, "model": "arima_2_1_1",
+            "history_years": history_years,
+            "error": "ARIMA forecasting requires at least 30 historical daily records.",
+        }
+
+    if not predict_dates:
+        last = _parse_date(ordered_dates[-1])
+        predict_dates = [
+            (last + timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(1, 8)
+        ]
+
+    parsed_dates: list[datetime] = []
+    for raw in predict_dates:
+        try:
+            parsed_dates.append(_parse_date(str(raw)))
+        except (TypeError, ValueError):
+            continue
+    if not parsed_dates:
+        return {
+            "predicted_eggs": 0, "forecast_date": None, "labels": [],
+            "dates": [], "data": [], "series": [],
+            "sizes": {key: 0 for key in SIZE_KEYS}, "sample_days": 0,
+            "temperature": None, "model": "arima_2_1_1",
+            "history_years": history_years,
+            "error": "No valid forecast dates were supplied.",
+        }
+
+    # Fit using historical daily totals, then forecast the requested horizon.
+        # Fit ARIMA and align predictions with the requested forecast dates.
+    try:
+        fitted = ARIMA(
+            values,
+            order=ARIMA_ORDER,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit()
+
+        last_history_date = _parse_date(ordered_dates[-1])
+
+        forecast_steps = [
+            (day - last_history_date).days
+            for day in parsed_dates
+        ]
+
+        if any(step <= 0 for step in forecast_steps):
+            raise ValueError(
+                "Requested forecast dates must be after the last historical date."
+            )
+
+        max_steps = max(forecast_steps)
+
+        raw_predictions = fitted.forecast(steps=max_steps)
+
+        predicted_totals = [
+            round(max(0.0, float(raw_predictions[step - 1])), 2)
+            for step in forecast_steps
+        ]
+
+        print("LAST HISTORICAL DATE:", last_history_date.strftime("%Y-%m-%d"))
+        print("REQUESTED FORECAST DATES:", [
+            day.strftime("%Y-%m-%d") for day in parsed_dates
+        ])
+        print("ARIMA FORECAST STEPS:", forecast_steps)
+        print("ALIGNED ARIMA PREDICTIONS:", predicted_totals)
+    except Exception as exc:
+        return {
+            "predicted_eggs": 0, "forecast_date": None, "labels": [],
+            "dates": [], "data": [], "series": [],
+            "sizes": {key: 0 for key in SIZE_KEYS}, "sample_days": 0,
+            "temperature": None, "model": "arima_2_1_1",
+            "history_years": history_years,
+            "error": f"ARIMA model fitting failed: {type(exc).__name__}: {exc}",
+        }
+
+    temps = temperatures or {}
+    series: list[dict[str, Any]] = []
+    for day, total in zip(parsed_dates, predicted_totals):
+        iso = day.strftime("%Y-%m-%d")
+        temp_raw = temps.get(iso)
+        try:
+            temperature = float(temp_raw) if temp_raw is not None else None
+        except (TypeError, ValueError):
+            temperature = None
+
+        point = _predict_one_day(
+            archive, day, temperature, history_years,
+            neutral_temperature, temp_shift_per_degree, temp_shift_cap,
+            eggs_per_tray, predicted_total=total,
+        )
+        series.append(point)
+
+    primary = series[0]
+    return {
+        "predicted_eggs": int(primary["eggs"]),
+        "forecast_date": primary["date"],
+        "labels": [point["label"] for point in series],
+        "dates": [point["date"] for point in series],
+        "data": [point["eggs"] for point in series],
+        "series": series,
+        "sizes": primary["sizes"],
+        "sample_days": int(primary["sample_days"]),
+        "temperature": primary["temperature"],
+        "model": "arima_2_1_1",
+        "history_years": history_years,
+        "error": None,
+    }
+
+
 def run_forecast(
     history: list[dict[str, Any]],
     predict_dates: list[str] | None = None,
@@ -419,7 +567,22 @@ def run_forecast(
     archive_start: str | None = None,
     archive_end: str | None = None,
 ) -> dict[str, Any]:
-    if str(model).lower() in {
+    normalized_model = str(model).lower()
+    if normalized_model in {"arima", "arima_2_1_1", "arima(2,1,1)"}:
+        return run_arima_temperature_forecast(
+            history,
+            predict_dates=predict_dates,
+            temperatures=temperatures,
+            history_years=history_years,
+            neutral_temperature=neutral_temperature,
+            temp_shift_per_degree=temp_shift_per_degree,
+            temp_shift_cap=temp_shift_cap,
+            eggs_per_tray=eggs_per_tray,
+            archive_start=archive_start,
+            archive_end=archive_end,
+        )
+
+    if normalized_model in {
         "three_year_temperature",
         "three_year_linear_regression",
         "archive_temperature",

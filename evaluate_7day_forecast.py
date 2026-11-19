@@ -1,0 +1,318 @@
+"""Seven-day-ahead backtesting for NB Poultry Farm forecasting.
+
+Run from the forecasting folder:
+    python evaluate_7day_forecast.py production.csv
+
+The test period is split into consecutive, non-overlapping 7-day blocks.
+For each block, both models are given only records dated before the block starts.
+No actual values from the seven forecast dates are used to generate predictions.
+
+Models:
+- Three-Year Linear Regression: mirrors src/service.py calendar-date logic.
+- ARIMA(2,1,1): comparison model.
+
+Outputs:
+- seven_day_backtest_results.csv
+- seven_day_actual_vs_predicted.png
+"""
+
+from __future__ import annotations
+
+import csv
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from statistics import mean
+
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
+
+from src.regression import fit_line, predict_y
+
+DATE_COLUMNS = ("date", "production_date", "ds")
+EGG_COLUMNS = ("eggs", "eggs_produced", "y")
+EGGS_PER_TRAY = 30
+HISTORY_YEARS = 3
+ARIMA_ORDER = (2, 1, 1)
+HORIZON_DAYS = 7
+
+
+def load_daily_totals(path: Path) -> list[tuple[datetime, float]]:
+    totals: dict[datetime, float] = {}
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise SystemExit(f"{path} has no header row.")
+        fields = {name.strip().lower(): name for name in reader.fieldnames}
+        date_key = next((fields[name] for name in DATE_COLUMNS if name in fields), None)
+        egg_key = next((fields[name] for name in EGG_COLUMNS if name in fields), None)
+        if date_key is None or egg_key is None:
+            raise SystemExit(
+                f"{path} needs a date column and an eggs column. "
+                f"Found: {', '.join(reader.fieldnames)}"
+            )
+        for row in reader:
+            raw_date = (row.get(date_key) or "").strip()
+            raw_eggs = (row.get(egg_key) or "").strip()
+            if not raw_date or not raw_eggs:
+                continue
+            day = datetime.strptime(raw_date[:10], "%Y-%m-%d")
+            eggs = float(raw_eggs)
+            if eggs < 0:
+                raise SystemExit(f"Negative egg total found on {day:%Y-%m-%d}.")
+            totals[day] = totals.get(day, 0.0) + eggs
+
+    rows = sorted(totals.items())
+    if len(rows) < 60:
+        raise SystemExit("At least 60 daily records are recommended.")
+    # The source dataset is expected to contain one record for every calendar day.
+    for previous, current in zip(rows, rows[1:]):
+        if (current[0] - previous[0]).days != 1:
+            raise SystemExit(
+                f"Missing calendar date between {previous[0]:%Y-%m-%d} "
+                f"and {current[0]:%Y-%m-%d}. Fill/check the dataset before backtesting."
+            )
+    return rows
+
+
+def round_to_tray(value: float) -> int:
+    value = max(0.0, value)
+    return int(round(value / EGGS_PER_TRAY) * EGGS_PER_TRAY)
+
+
+def build_archive(history: list[tuple[datetime, float]]) -> dict[str, dict[str, float]]:
+    """Build the total-egg portion of service.py's normalized archive."""
+    return {
+        day.strftime("%Y-%m-%d"): {"eggs": float(eggs)}
+        for day, eggs in history
+        if eggs > 0
+    }
+
+
+def same_calendar_dated_samples(
+    archive: dict[str, dict[str, float]], target: datetime
+) -> list[tuple[datetime, dict[str, float]]]:
+    by_year: dict[int, tuple[datetime, dict[str, float]]] = {}
+    for key, row in archive.items():
+        day = datetime.strptime(key, "%Y-%m-%d")
+        if day >= target:
+            continue
+        if day.month == target.month and day.day == target.day:
+            by_year[day.year] = (day, dict(row))
+
+    if by_year:
+        years = sorted(by_year)[-HISTORY_YEARS:]
+        return [by_year[year] for year in years]
+
+    # Match service.py's nearby day-of-year fallback.
+    target_doy = target.timetuple().tm_yday
+    nearby: dict[int, list[dict[str, float]]] = {}
+    for key, row in archive.items():
+        day = datetime.strptime(key, "%Y-%m-%d")
+        if day >= target:
+            continue
+        if abs(day.timetuple().tm_yday - target_doy) > 3:
+            continue
+        nearby.setdefault(day.year, []).append(row)
+
+    by_year_fallback: dict[int, dict[str, float]] = {}
+    for year, year_rows in nearby.items():
+        by_year_fallback[year] = {
+            "eggs": sum(item["eggs"] for item in year_rows) / len(year_rows)
+        }
+    years = sorted(by_year_fallback, reverse=True)[:HISTORY_YEARS]
+    return [
+        (datetime(year, target.month, min(target.day, 28)), by_year_fallback[year])
+        for year in sorted(years)
+    ]
+
+
+def predict_three_year_day(
+    history: list[tuple[datetime, float]], target: datetime
+) -> float:
+    archive = build_archive(history)
+    dated_samples = same_calendar_dated_samples(archive, target)
+    if not dated_samples:
+        return 0.0
+
+    if len(dated_samples) == 1:
+        predicted = round_to_tray(dated_samples[0][1]["eggs"])
+        return float(predicted)
+
+    xs = [float(day.year) for day, _ in dated_samples]
+    ys = [float(row["eggs"]) for _, row in dated_samples]
+    slope, intercept = fit_line(xs, ys)
+    predicted = predict_y(slope, intercept, float(target.year))
+    predicted = round_to_tray(predicted)
+    if predicted <= 0:
+        predicted = round_to_tray(sum(ys) / len(ys))
+    return float(predicted)
+
+
+def predict_arima_seven_days(
+    history: list[tuple[datetime, float]]
+) -> list[float]:
+    values = [eggs for _, eggs in history]
+    fitted = ARIMA(
+        values,
+        order=ARIMA_ORDER,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    ).fit()
+    raw_forecast = fitted.forecast(steps=HORIZON_DAYS)
+    return [float(round_to_tray(float(value))) for value in raw_forecast]
+
+
+def calculate_metrics(actuals: list[float], predictions: list[float]) -> dict[str, float]:
+    errors = [actual - predicted for actual, predicted in zip(actuals, predictions)]
+    mae = mean(abs(error) for error in errors)
+    rmse = (mean(error * error for error in errors)) ** 0.5
+    nonzero_pairs = [
+        (actual, predicted)
+        for actual, predicted in zip(actuals, predictions)
+        if actual != 0
+    ]
+    mape = mean(
+        abs(actual - predicted) / abs(actual) * 100
+        for actual, predicted in nonzero_pairs
+    ) if nonzero_pairs else float("nan")
+    avg_actual = mean(actuals)
+    ss_tot = sum((actual - avg_actual) ** 2 for actual in actuals)
+    ss_res = sum(error * error for error in errors)
+    r2 = float("nan") if ss_tot == 0 else 1 - ss_res / ss_tot
+    return {"mae": mae, "rmse": rmse, "mape": mape, "r2": r2}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print("Usage: python evaluate_7day_forecast.py production.csv", file=sys.stderr)
+        return 1
+    csv_path = Path(argv[1])
+    if not csv_path.is_file():
+        print(f"File not found: {csv_path}", file=sys.stderr)
+        return 1
+
+    rows = load_daily_totals(csv_path)
+    first_test_index = int(len(rows) * 0.8)
+    first_test_index = ((first_test_index + HORIZON_DAYS - 1) // HORIZON_DAYS) * HORIZON_DAYS
+    if first_test_index < 30 or first_test_index >= len(rows):
+        raise SystemExit("Not enough data for an 80/20 split and seven-day backtesting.")
+
+    test_rows = rows[first_test_index:]
+    full_blocks = len(test_rows) // HORIZON_DAYS
+    if full_blocks == 0:
+        raise SystemExit("The test period must contain at least seven days.")
+
+    result_rows: list[tuple[str, str, float, float, int]] = []
+    model_actuals: dict[str, list[float]] = {
+        "Three-Year Linear Regression": [],
+        f"ARIMA{ARIMA_ORDER}": [],
+    }
+    model_predictions: dict[str, list[float]] = {
+        "Three-Year Linear Regression": [],
+        f"ARIMA{ARIMA_ORDER}": [],
+    }
+    failed_blocks = {name: 0 for name in model_actuals}
+
+    for block_number in range(full_blocks):
+        start = first_test_index + block_number * HORIZON_DAYS
+        block = rows[start:start + HORIZON_DAYS]
+        origin_history = rows[:start]
+        target_dates = [day for day, _ in block]
+        actuals = [eggs for _, eggs in block]
+        print(
+            f"Evaluating block {block_number + 1}/{full_blocks}: "
+            f"{target_dates[0]:%Y-%m-%d} to {target_dates[-1]:%Y-%m-%d}",
+            flush=True,
+        )
+
+        # The seven target-day actuals are not included in origin_history.
+        three_year_predictions = [
+            predict_three_year_day(origin_history, target) for target in target_dates
+        ]
+        model_name = "Three-Year Linear Regression"
+        for target, actual, predicted in zip(target_dates, actuals, three_year_predictions):
+            model_actuals[model_name].append(actual)
+            model_predictions[model_name].append(predicted)
+            result_rows.append((model_name, target.strftime("%Y-%m-%d"), actual, predicted, block_number + 1))
+
+        model_name = f"ARIMA{ARIMA_ORDER}"
+        try:
+            arima_predictions = predict_arima_seven_days(origin_history)
+            for target, actual, predicted in zip(target_dates, actuals, arima_predictions):
+                model_actuals[model_name].append(actual)
+                model_predictions[model_name].append(predicted)
+                result_rows.append((model_name, target.strftime("%Y-%m-%d"), actual, predicted, block_number + 1))
+        except Exception as exc:
+            failed_blocks[model_name] += 1
+            print(
+                f"  ARIMA block failed ({type(exc).__name__}): {exc}",
+                flush=True,
+            )
+
+    output_csv = Path("seven_day_backtest_results.csv")
+    with output_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["model", "date", "actual_eggs", "predicted_eggs", "forecast_block"])
+        writer.writerows(result_rows)
+
+    print(f"\nTotal historical records: {len(rows)}")
+    print(f"Training records before test period: {first_test_index}")
+    print(f"Testing period: {test_rows[0][0]:%Y-%m-%d} to {rows[first_test_index + full_blocks * HORIZON_DAYS - 1][0]:%Y-%m-%d}")
+    print(f"Complete seven-day forecast blocks: {full_blocks}")
+    print(f"Unused trailing test days: {len(test_rows) - full_blocks * HORIZON_DAYS}")
+    print("\nSeven-day backtesting results:")
+    print(f"{'Model':<32} {'Days':>7} {'Failed blocks':>14} {'MAE':>10} {'RMSE':>10} {'MAPE':>9} {'R²':>9}")
+
+    summary_metrics = {}
+    for model_name in model_actuals:
+        actuals = model_actuals[model_name]
+        predictions = model_predictions[model_name]
+        if not actuals:
+            print(f"{model_name:<32} No successful predictions")
+            continue
+        metrics = calculate_metrics(actuals, predictions)
+        summary_metrics[model_name] = metrics
+        print(
+            f"{model_name:<32} {len(actuals):>7} {failed_blocks[model_name]:>14} "
+            f"{metrics['mae']:>10.2f} {metrics['rmse']:>10.2f} "
+            f"{metrics['mape']:>8.2f}% {metrics['r2']:>9.4f}"
+        )
+
+    # Plot actual values once and each model's predictions.
+    dates_for_plot = [day for day, _ in rows[first_test_index:first_test_index + full_blocks * HORIZON_DAYS]]
+    actual_for_plot = [eggs for _, eggs in rows[first_test_index:first_test_index + full_blocks * HORIZON_DAYS]]
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(dates_for_plot, actual_for_plot, label="Actual production", linewidth=2)
+    for model_name, predictions in model_predictions.items():
+        if len(predictions) == len(dates_for_plot):
+            ax.plot(dates_for_plot, predictions, label=model_name, alpha=0.85)
+    ax.set_title("Actual vs. Predicted Egg Production — 7-Day Backtesting")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Eggs")
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    fig.autofmt_xdate()
+    ax.legend()
+    fig.tight_layout()
+    graph_path = Path("seven_day_actual_vs_predicted.png")
+    fig.savefig(graph_path, dpi=200)
+    plt.close(fig)
+
+    print(f"\nSaved predictions: {output_csv.resolve()}")
+    print(f"Saved graph: {graph_path.resolve()}")
+    print(
+        "\nMethod: non-overlapping seven-day forecast blocks. Each block is "
+        "predicted using only records dated before that block starts."
+    )
+    print(
+        "Important: the Three-Year model follows the primary service.py total-egg "
+        "logic. Temperature-based egg-size allocation is not evaluated because "
+        "historical temperature data is not available in production.csv."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

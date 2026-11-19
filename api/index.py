@@ -49,9 +49,14 @@ def _handle_forecast():
             {
                 "ok": True,
                 "service": "nb-farm-forecasting",
-                "method": "three_year_linear_regression",
+                "method": "arima_2_1_1",
+                "alternative": "three_year_linear_regression",
                 "legacy": "linear_regression",
-                "note": "Primary model is three_year_linear_regression; legacy 7-day OLS is opt-in only.",
+                "note": (
+                    "Primary model is ARIMA(2,1,1); "
+                    "three-year linear regression and legacy "
+                    "7-day OLS are available as alternatives."
+                ),
             }
         )
 
@@ -62,12 +67,18 @@ def _handle_forecast():
     history = payload.get("history") or []
     predict_dates = payload.get("predict_dates") or []
     temperatures = payload.get("temperatures") or {}
-    model = payload.get("model", "three_year_temperature")
+
+    # ARIMA(2,1,1) is now the default forecasting model.
+    model = payload.get("model", "arima_2_1_1")
 
     window = payload.get("window", DEFAULT_WINDOW)
     history_years = payload.get("history_years", DEFAULT_HISTORY_YEARS)
-    neutral_temperature = payload.get("neutral_temperature", DEFAULT_NEUTRAL_TEMP)
-    temp_shift_per_degree = payload.get("temp_shift_per_degree", DEFAULT_TEMP_SHIFT)
+    neutral_temperature = payload.get(
+        "neutral_temperature", DEFAULT_NEUTRAL_TEMP
+    )
+    temp_shift_per_degree = payload.get(
+        "temp_shift_per_degree", DEFAULT_TEMP_SHIFT
+    )
     temp_shift_cap = payload.get("temp_shift_cap", DEFAULT_TEMP_SHIFT_CAP)
     eggs_per_tray = payload.get("eggs_per_tray", EGGS_PER_TRAY)
     archive_start = payload.get("archive_start")
@@ -77,29 +88,42 @@ def _handle_forecast():
         window = int(window)
     except (TypeError, ValueError):
         window = DEFAULT_WINDOW
+
     try:
         history_years = int(history_years)
     except (TypeError, ValueError):
         history_years = DEFAULT_HISTORY_YEARS
+
     try:
         neutral_temperature = float(neutral_temperature)
         temp_shift_per_degree = float(temp_shift_per_degree)
         temp_shift_cap = float(temp_shift_cap)
         eggs_per_tray = int(eggs_per_tray)
     except (TypeError, ValueError):
-        return jsonify({"error": "Invalid temperature/options payload."}), 400
+        return jsonify(
+            {"error": "Invalid temperature/options payload."}
+        ), 400
 
     if archive_start is not None:
         archive_start = str(archive_start)[:10] or None
+
     if archive_end is not None:
         archive_end = str(archive_end)[:10] or None
 
     if not isinstance(history, list):
-        return jsonify({"error": "history must be a list of daily harvest rows"}), 400
+        return jsonify(
+            {"error": "history must be a list of daily harvest rows"}
+        ), 400
+
     if predict_dates and not isinstance(predict_dates, list):
-        return jsonify({"error": "predict_dates must be a list of YYYY-MM-DD"}), 400
+        return jsonify(
+            {"error": "predict_dates must be a list of YYYY-MM-DD"}
+        ), 400
+
     if temperatures and not isinstance(temperatures, dict):
-        return jsonify({"error": "temperatures must be an object of date -> °C"}), 400
+        return jsonify(
+            {"error": "temperatures must be an object of date -> °C"}
+        ), 400
 
     result = run_forecast(
         history,
@@ -115,6 +139,7 @@ def _handle_forecast():
         archive_start=archive_start,
         archive_end=archive_end,
     )
+
     status = 200 if not result.get("error") else 422
     return jsonify(result), status
 
@@ -134,4 +159,7 @@ def forecast():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", 8001)))
+    app.run(
+        host="127.0.0.1",
+        port=int(os.environ.get("PORT", 8001))
+    )
