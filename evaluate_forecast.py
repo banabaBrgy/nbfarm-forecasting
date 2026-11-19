@@ -2,6 +2,7 @@
 
 Usage (from the forecasting project folder):
     python evaluate_forecast.py production.csv
+    python evaluate_forecast.py production.csv --start 2026-10-01 --end 2026-10-31
 
 Models:
 - three_year_linear_regression: mirrors the primary model in src/service.py
@@ -15,6 +16,7 @@ Outputs:
 
 from __future__ import annotations
 
+import argparse
 import csv
 import sys
 from datetime import datetime
@@ -65,6 +67,49 @@ def load_daily_totals(path: Path) -> list[tuple[datetime, float]]:
     if len(rows) < 30:
         raise SystemExit(f"{path} needs at least 30 daily totals for backtesting.")
     return rows
+
+
+def parse_iso_date(value: str, flag: str) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise SystemExit(f"{flag} must be YYYY-MM-DD, got {value!r}.") from exc
+
+
+def parse_cli(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Chronological backtesting for NB Poultry Farm forecasting."
+    )
+    parser.add_argument("csv_path", help="Path to production.csv")
+    parser.add_argument("--start", metavar="YYYY-MM-DD", help="First test date (inclusive)")
+    parser.add_argument("--end", metavar="YYYY-MM-DD", help="Last test date (inclusive)")
+    return parser.parse_args(argv[1:])
+
+
+def select_test_window(
+    rows: list[tuple[datetime, float]],
+    start: datetime | None,
+    end: datetime | None,
+) -> tuple[int, int]:
+    """Return (first_test_index, stop_index) for the scored window."""
+    if start is None and end is None:
+        first = int(len(rows) * 0.8)
+        return first, len(rows)
+
+    if start is None or end is None:
+        raise SystemExit("Pass both --start and --end, or neither.")
+    if start > end:
+        raise SystemExit("--start must be on or before --end.")
+
+    first = next((index for index, (day, _) in enumerate(rows) if day >= start), None)
+    if first is None:
+        raise SystemExit(f"No records on or after --start {start:%Y-%m-%d}.")
+    last = next((index for index in range(len(rows) - 1, -1, -1) if rows[index][0] <= end), None)
+    if last is None or last < first:
+        raise SystemExit(f"No records between {start:%Y-%m-%d} and {end:%Y-%m-%d}.")
+    if first == 0:
+        raise SystemExit("Need harvest days before --start so the models have history.")
+    return first, last + 1
 
 
 def round_to_tray(value: float) -> int:
@@ -164,21 +209,23 @@ def calculate_metrics(actuals: list[float], predictions: list[float]) -> dict[st
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("Usage: python evaluate_forecast.py production.csv", file=sys.stderr)
-        return 1
-
-    csv_path = Path(argv[1])
+    args = parse_cli(argv)
+    csv_path = Path(args.csv_path)
     if not csv_path.is_file():
         print(f"File not found: {csv_path}", file=sys.stderr)
         return 1
 
-    rows = load_daily_totals(csv_path)
-    split_index = int(len(rows) * 0.8)
-    if split_index < 30 or split_index >= len(rows):
-        raise SystemExit("Not enough records for the chronological 80/20 split.")
+    start = parse_iso_date(args.start, "--start") if args.start else None
+    end = parse_iso_date(args.end, "--end") if args.end else None
 
-    test_rows = rows[split_index:]
+    rows = load_daily_totals(csv_path)
+    split_index, stop_index = select_test_window(rows, start, end)
+    if start is None and (split_index < 30 or split_index >= len(rows)):
+        raise SystemExit("Not enough records for the chronological 80/20 split.")
+    if not rows[split_index:stop_index]:
+        raise SystemExit("The selected date range has no harvest days to score.")
+
+    test_rows = rows[split_index:stop_index]
     model_functions: dict[str, Callable] = {
         "Three-Year Linear Regression": predict_three_year,
         "ARIMA(1,1,1)": predict_arima,

@@ -2,6 +2,11 @@
 
 Run from the forecasting folder:
     python evaluate_7day_forecast.py production.csv
+    python evaluate_7day_forecast.py production.csv --start 2026-10-01 --end 2026-10-07
+
+Without --start/--end, the last 20% of the file is the test period.
+With a date range, only that window is scored. History is still every
+record dated before each 7-day block starts.
 
 The test period is split into consecutive, non-overlapping 7-day blocks.
 For each block, both models are given only records dated before the block starts.
@@ -18,9 +23,10 @@ Outputs:
 
 from __future__ import annotations
 
+import argparse
 import csv
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
@@ -74,6 +80,50 @@ def load_daily_totals(path: Path) -> list[tuple[datetime, float]]:
                 f"and {current[0]:%Y-%m-%d}. Fill/check the dataset before backtesting."
             )
     return rows
+
+
+def parse_iso_date(value: str, flag: str) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise SystemExit(f"{flag} must be YYYY-MM-DD, got {value!r}.") from exc
+
+
+def parse_cli(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Seven-day-ahead backtesting for NB Poultry Farm forecasting."
+    )
+    parser.add_argument("csv_path", help="Path to production.csv")
+    parser.add_argument("--start", metavar="YYYY-MM-DD", help="First test date (inclusive)")
+    parser.add_argument("--end", metavar="YYYY-MM-DD", help="Last test date (inclusive)")
+    return parser.parse_args(argv[1:])
+
+
+def select_test_window(
+    rows: list[tuple[datetime, float]],
+    start: datetime | None,
+    end: datetime | None,
+) -> tuple[int, int]:
+    """Return (first_test_index, stop_index) for the scored window."""
+    if start is None and end is None:
+        first = int(len(rows) * 0.8)
+        first = ((first + HORIZON_DAYS - 1) // HORIZON_DAYS) * HORIZON_DAYS
+        return first, len(rows)
+
+    if start is None or end is None:
+        raise SystemExit("Pass both --start and --end, or neither.")
+    if start > end:
+        raise SystemExit("--start must be on or before --end.")
+
+    first = next((index for index, (day, _) in enumerate(rows) if day >= start), None)
+    if first is None:
+        raise SystemExit(f"No records on or after --start {start:%Y-%m-%d}.")
+    last = next((index for index in range(len(rows) - 1, -1, -1) if rows[index][0] <= end), None)
+    if last is None or last < first:
+        raise SystemExit(f"No records between {start:%Y-%m-%d} and {end:%Y-%m-%d}.")
+    if first == 0:
+        raise SystemExit("Need harvest days before --start so the models have history.")
+    return first, last + 1
 
 
 def round_to_tray(value: float) -> int:
@@ -185,21 +235,21 @@ def calculate_metrics(actuals: list[float], predictions: list[float]) -> dict[st
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("Usage: python evaluate_7day_forecast.py production.csv", file=sys.stderr)
-        return 1
-    csv_path = Path(argv[1])
+    args = parse_cli(argv)
+    csv_path = Path(args.csv_path)
     if not csv_path.is_file():
         print(f"File not found: {csv_path}", file=sys.stderr)
         return 1
 
+    start = parse_iso_date(args.start, "--start") if args.start else None
+    end = parse_iso_date(args.end, "--end") if args.end else None
+
     rows = load_daily_totals(csv_path)
-    first_test_index = int(len(rows) * 0.8)
-    first_test_index = ((first_test_index + HORIZON_DAYS - 1) // HORIZON_DAYS) * HORIZON_DAYS
-    if first_test_index < 30 or first_test_index >= len(rows):
+    first_test_index, stop_index = select_test_window(rows, start, end)
+    if start is None and (first_test_index < 30 or first_test_index >= len(rows)):
         raise SystemExit("Not enough data for an 80/20 split and seven-day backtesting.")
 
-    test_rows = rows[first_test_index:]
+    test_rows = rows[first_test_index:stop_index]
     full_blocks = len(test_rows) // HORIZON_DAYS
     if full_blocks == 0:
         raise SystemExit("The test period must contain at least seven days.")
@@ -257,9 +307,10 @@ def main(argv: list[str]) -> int:
         writer.writerow(["model", "date", "actual_eggs", "predicted_eggs", "forecast_block"])
         writer.writerows(result_rows)
 
+    scored_end = rows[first_test_index + full_blocks * HORIZON_DAYS - 1][0]
     print(f"\nTotal historical records: {len(rows)}")
     print(f"Training records before test period: {first_test_index}")
-    print(f"Testing period: {test_rows[0][0]:%Y-%m-%d} to {rows[first_test_index + full_blocks * HORIZON_DAYS - 1][0]:%Y-%m-%d}")
+    print(f"Testing period: {test_rows[0][0]:%Y-%m-%d} to {scored_end:%Y-%m-%d}")
     print(f"Complete seven-day forecast blocks: {full_blocks}")
     print(f"Unused trailing test days: {len(test_rows) - full_blocks * HORIZON_DAYS}")
     print("\nSeven-day backtesting results:")
