@@ -413,6 +413,65 @@ def run_archive_temperature_forecast(
     }
 
 
+def _arima_totals_before_each_date(
+    archive: dict[str, dict[str, float]],
+    parsed_dates: list[datetime],
+) -> dict[str, float | None]:
+    """One-step (or N-step) ARIMA using only harvest days strictly before each target.
+
+    Past chart days walk forward with actuals so the line does not flatten.
+    Future days keep a multi-step forecast from the last actual day.
+    """
+    ordered = sorted(archive)
+    parsed_history = [_parse_date(key) for key in ordered]
+    totals: dict[str, float | None] = {}
+    fitted = None
+    fitted_until: datetime | None = None
+
+    for day in sorted(parsed_dates):
+        iso = day.strftime("%Y-%m-%d")
+        train_end = day - timedelta(days=1)
+        train_keys = [
+            key for key, hist_day in zip(ordered, parsed_history)
+            if hist_day <= train_end
+        ]
+        if len(train_keys) < ARIMA_MIN_POINTS:
+            totals[iso] = None
+            fitted = None
+            fitted_until = None
+            continue
+
+        last_train = _parse_date(train_keys[-1])
+        try:
+            if fitted is None or fitted_until is None or fitted_until > last_train:
+                values = [float(archive[key]["eggs"]) for key in train_keys]
+                fitted = ARIMA(
+                    values,
+                    order=ARIMA_ORDER,
+                    enforce_stationarity=False,
+                    enforce_invertibility=False,
+                ).fit()
+                fitted_until = last_train
+            elif fitted_until < last_train:
+                for key, hist_day in zip(ordered, parsed_history):
+                    if fitted_until < hist_day <= last_train:
+                        fitted = fitted.append([float(archive[key]["eggs"])])
+                        fitted_until = hist_day
+
+            steps = (day - fitted_until).days
+            if steps <= 0:
+                totals[iso] = None
+                continue
+            raw = fitted.forecast(steps=steps)
+            totals[iso] = round(max(0.0, float(raw[steps - 1])), 2)
+        except Exception:
+            totals[iso] = None
+            fitted = None
+            fitted_until = None
+
+    return totals
+
+
 def run_arima_temperature_forecast(
     history: list[dict[str, Any]],
     predict_dates: list[str] | None = None,
@@ -472,43 +531,8 @@ def run_arima_temperature_forecast(
             "error": "No valid forecast dates were supplied.",
         }
 
-    # Fit using historical daily totals, then forecast the requested horizon.
-        # Fit ARIMA and align predictions with the requested forecast dates.
     try:
-        fitted = ARIMA(
-            values,
-            order=ARIMA_ORDER,
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        ).fit()
-
-        last_history_date = _parse_date(ordered_dates[-1])
-
-        forecast_steps = [
-            (day - last_history_date).days
-            for day in parsed_dates
-        ]
-
-        if any(step <= 0 for step in forecast_steps):
-            raise ValueError(
-                "Requested forecast dates must be after the last historical date."
-            )
-
-        max_steps = max(forecast_steps)
-
-        raw_predictions = fitted.forecast(steps=max_steps)
-
-        predicted_totals = [
-            round(max(0.0, float(raw_predictions[step - 1])), 2)
-            for step in forecast_steps
-        ]
-
-        print("LAST HISTORICAL DATE:", last_history_date.strftime("%Y-%m-%d"))
-        print("REQUESTED FORECAST DATES:", [
-            day.strftime("%Y-%m-%d") for day in parsed_dates
-        ])
-        print("ARIMA FORECAST STEPS:", forecast_steps)
-        print("ALIGNED ARIMA PREDICTIONS:", predicted_totals)
+        predicted_by_day = _arima_totals_before_each_date(archive, parsed_dates)
     except Exception as exc:
         return {
             "predicted_eggs": 0, "forecast_date": None, "labels": [],
@@ -519,10 +543,23 @@ def run_arima_temperature_forecast(
             "error": f"ARIMA model fitting failed: {type(exc).__name__}: {exc}",
         }
 
+    if not any(total is not None for total in predicted_by_day.values()):
+        return {
+            "predicted_eggs": 0, "forecast_date": None, "labels": [],
+            "dates": [], "data": [], "series": [],
+            "sizes": {key: 0 for key in SIZE_KEYS}, "sample_days": 0,
+            "temperature": None, "model": "arima_2_1_1",
+            "history_years": history_years,
+            "error": "ARIMA forecasting requires at least 30 historical daily records before each date.",
+        }
+
     temps = temperatures or {}
     series: list[dict[str, Any]] = []
-    for day, total in zip(parsed_dates, predicted_totals):
+    for day in parsed_dates:
         iso = day.strftime("%Y-%m-%d")
+        total = predicted_by_day.get(iso)
+        if total is None:
+            continue
         temp_raw = temps.get(iso)
         try:
             temperature = float(temp_raw) if temp_raw is not None else None
@@ -535,6 +572,16 @@ def run_arima_temperature_forecast(
             eggs_per_tray, predicted_total=total,
         )
         series.append(point)
+
+    if not series:
+        return {
+            "predicted_eggs": 0, "forecast_date": None, "labels": [],
+            "dates": [], "data": [], "series": [],
+            "sizes": {key: 0 for key in SIZE_KEYS}, "sample_days": 0,
+            "temperature": None, "model": "arima_2_1_1",
+            "history_years": history_years,
+            "error": "ARIMA forecasting requires at least 30 historical daily records before each date.",
+        }
 
     primary = series[0]
     return {

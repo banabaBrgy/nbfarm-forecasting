@@ -181,6 +181,38 @@ class ForecastTests(unittest.TestCase):
         )
         self.assertGreaterEqual(result["data"][0], 0)
 
+    def test_arima_backtests_a_past_date_from_prior_days(self):
+        start = datetime(2026, 1, 1)
+        history = [
+            {
+                "date": (start + timedelta(days=offset)).strftime("%Y-%m-%d"),
+                "eggs": 7000 + (offset % 5) * 30,
+            }
+            for offset in range(45)
+        ]
+        result = run_forecast(
+            history,
+            predict_dates=["2026-02-10"],
+            model="arima_2_1_1",
+        )
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["model"], "arima_2_1_1")
+        self.assertGreater(result["predicted_eggs"], 0)
+        self.assertEqual(result["dates"], ["2026-02-10"])
+
+    def test_arima_rejects_too_little_history(self):
+        history = [
+            {"date": f"2026-01-{day:02d}", "eggs": 7000}
+            for day in range(1, 10)
+        ]
+        result = run_forecast(
+            history,
+            predict_dates=["2026-01-20"],
+            model="arima_2_1_1",
+        )
+        self.assertEqual(result["predicted_eggs"], 0)
+        self.assertIsNotNone(result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
