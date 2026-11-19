@@ -1,4 +1,4 @@
-"""Verify that the backtest's Three-Year predictions match src.service.run_forecast.
+"""Verify that saved ARIMA(2,1,1) backtest rows match src.service.run_forecast.
 
 Run from the forecasting folder:
     python verify_three_year_service.py production.csv
@@ -85,7 +85,7 @@ def main(argv: list[str]) -> int:
         result = run_forecast(
             history_payload,
             predict_dates=target_dates,
-            model="three_year_linear_regression",
+            model="arima_2_1_1",
             history_years=HISTORY_YEARS,
             eggs_per_tray=EGGS_PER_TRAY,
         )
@@ -110,7 +110,7 @@ def main(argv: list[str]) -> int:
                 eval_map = {
                     row["date"]: int(round(float(row["predicted_eggs"])))
                     for row in reader
-                    if row.get("model") == "Three-Year Linear Regression"
+                    if row.get("model") == "ARIMA(2, 1, 1)"
                 }
             for date, service_value in zip(target_dates, service_predictions):
                 if date in eval_map:
@@ -133,16 +133,15 @@ def main(argv: list[str]) -> int:
 
     if compared == 0:
         print(
-            "\nNo matching Three-Year rows were found in seven_day_backtest_results.csv. "
+            "\nNo matching ARIMA(2, 1, 1) rows were found in seven_day_backtest_results.csv. "
             "Make sure that file is in the current forecasting folder."
         )
         return 2
 
     print(
-        "\nPASS: Three-Year predictions from service.py match the saved backtest "
+        "\nPASS: ARIMA(2,1,1) predictions from service.py match the saved backtest "
         "predictions for all compared dates."
     )
-    print("No existing forecasting code was changed.")
     return 0
 
 

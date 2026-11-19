@@ -4,10 +4,8 @@ Usage (from the forecasting project folder):
     python evaluate_forecast.py production.csv
     python evaluate_forecast.py production.csv --start 2026-10-01 --end 2026-10-31
 
-Models:
-- three_year_linear_regression: mirrors the primary model in src/service.py
-- arima: ARIMA(1, 1, 1) comparison baseline
-- legacy_linear_regression: optional reference model using recent daily trend
+The live forecasting model in src/service.py is ARIMA(2,1,1).
+This script scores that same ARIMA(2,1,1) model.
 
 Outputs:
 - evaluation_results.csv
@@ -27,13 +25,10 @@ from typing import Callable
 import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
 
-from src.regression import fit_line, predict_y
-
 DATE_COLUMNS = ("date", "production_date", "ds")
 EGG_COLUMNS = ("eggs", "eggs_produced", "y")
 EGGS_PER_TRAY = 30
-HISTORY_YEARS = 3
-ARIMA_ORDER = (1, 1, 1)
+ARIMA_ORDER = (2, 1, 1)
 
 
 def load_daily_totals(path: Path) -> list[tuple[datetime, float]]:
@@ -117,57 +112,6 @@ def round_to_tray(value: float) -> int:
     return int(round(value / EGGS_PER_TRAY) * EGGS_PER_TRAY)
 
 
-def predict_three_year(
-    history: list[tuple[datetime, float]], target: datetime
-) -> float | None:
-    """Mirror the primary service model's same-calendar-day year trend."""
-    matching: dict[int, float] = {}
-    for day, eggs in history:
-        if day < target and day.month == target.month and day.day == target.day:
-            matching[day.year] = eggs
-
-    samples: list[tuple[int, float]] = []
-    if matching:
-        years = sorted(matching)[-HISTORY_YEARS:]
-        samples = [(year, matching[year]) for year in years]
-    else:
-        # Match service.py fallback: average nearby day-of-year rows per year,
-        # within +/- 3 days of the target's day-of-year.
-        target_doy = target.timetuple().tm_yday
-        nearby: dict[int, list[float]] = {}
-        for day, eggs in history:
-            if day >= target:
-                continue
-            if abs(day.timetuple().tm_yday - target_doy) <= 3:
-                nearby.setdefault(day.year, []).append(eggs)
-        years = sorted(nearby)[-HISTORY_YEARS:]
-        samples = [(year, mean(nearby[year])) for year in years]
-
-    if not samples:
-        return None
-    if len(samples) == 1:
-        return float(round_to_tray(samples[0][1]))
-
-    xs = [float(year) for year, _ in samples]
-    ys = [eggs for _, eggs in samples]
-    slope, intercept = fit_line(xs, ys)
-    return float(round_to_tray(predict_y(slope, intercept, float(target.year))))
-
-
-def predict_legacy(
-    history: list[tuple[datetime, float]], target: datetime, window: int = 7
-) -> float | None:
-    if len(history) < 2:
-        return None
-    train = history[-window:]
-    origin = train[0][0]
-    xs = [(day - origin).days for day, _ in train]
-    ys = [eggs for _, eggs in train]
-    slope, intercept = fit_line([float(x) for x in xs], ys)
-    target_x = (target - origin).days
-    return float(predict_y(slope, intercept, float(target_x)))
-
-
 def predict_arima(
     history: list[tuple[datetime, float]], target: datetime
 ) -> float | None:
@@ -227,9 +171,7 @@ def main(argv: list[str]) -> int:
 
     test_rows = rows[split_index:stop_index]
     model_functions: dict[str, Callable] = {
-        "Three-Year Linear Regression": predict_three_year,
-        "ARIMA(1,1,1)": predict_arima,
-        "Legacy Linear Regression": predict_legacy,
+        "ARIMA(2,1,1)": predict_arima,
     }
 
     results: dict[str, list[tuple[str, float, float]]] = {}
@@ -297,8 +239,7 @@ def main(argv: list[str]) -> int:
 
     print(f"\nSaved predictions: {output_csv.resolve()}")
     print(f"Saved graph: {graph_path.resolve()}")
-    print("\nNote: ARIMA is a comparison model. Do not replace the system model "
-          "until the results and methodology have been reviewed.")
+    print("\nNote: The live system model is ARIMA(2,1,1) in src/service.py.")
     return 0
 
 

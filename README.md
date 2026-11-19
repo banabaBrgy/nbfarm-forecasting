@@ -2,12 +2,10 @@
 
 Separate Python service used by Laravel (`nb_system`).
 
-**Primary model:** `three_year_temperature`  
-- Same calendar day across up to 3 years of harvest history  
+**Forecasting model:** `arima_2_1_1` (ARIMA(2,1,1))  
+- Daily egg totals come from ARIMA(2,1,1)  
 - Tomorrow’s temperature shifts Small ↔ Large  
 - Returns total + size breakdown  
-
-**Legacy model:** `linear_regression` (old 7-day OLS), still available via `"model": "linear_regression"`.
 
 This service does **not** connect to MySQL. Laravel sends history + temperatures.
 
@@ -37,7 +35,7 @@ Body:
 
 ```json
 {
-  "model": "three_year_temperature",
+  "model": "arima_2_1_1",
   "history": [
     {
       "date": "2023-10-05",
@@ -63,7 +61,7 @@ Body:
 
 ```bash
 cd forecasting
-python -m unittest tests.test_regression
+python -m unittest tests.test_arima
 ```
 
 ## Vercel

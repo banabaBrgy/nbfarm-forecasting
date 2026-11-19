@@ -50,13 +50,8 @@ def _handle_forecast():
                 "ok": True,
                 "service": "nb-farm-forecasting",
                 "method": "arima_2_1_1",
-                "alternative": "three_year_linear_regression",
-                "legacy": "linear_regression",
-                "note": (
-                    "Primary model is ARIMA(2,1,1); "
-                    "three-year linear regression and legacy "
-                    "7-day OLS are available as alternatives."
-                ),
+                "model": "ARIMA(2,1,1)",
+                "note": "The forecasting model is ARIMA(2,1,1).",
             }
         )
 
@@ -68,8 +63,8 @@ def _handle_forecast():
     predict_dates = payload.get("predict_dates") or []
     temperatures = payload.get("temperatures") or {}
 
-    # ARIMA(2,1,1) is now the default forecasting model.
-    model = payload.get("model", "arima_2_1_1")
+    # The only forecasting model is ARIMA(2,1,1).
+    model = "arima_2_1_1"
 
     window = payload.get("window", DEFAULT_WINDOW)
     history_years = payload.get("history_years", DEFAULT_HISTORY_YEARS)

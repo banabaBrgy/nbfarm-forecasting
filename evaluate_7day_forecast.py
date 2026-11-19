@@ -9,12 +9,11 @@ With a date range, only that window is scored. History is still every
 record dated before each 7-day block starts.
 
 The test period is split into consecutive, non-overlapping 7-day blocks.
-For each block, both models are given only records dated before the block starts.
+For each block, ARIMA(2,1,1) is given only records dated before the block starts.
 No actual values from the seven forecast dates are used to generate predictions.
 
-Models:
-- Three-Year Linear Regression: mirrors src/service.py calendar-date logic.
-- ARIMA(2,1,1): comparison model.
+The live forecasting model in src/service.py is ARIMA(2,1,1).
+This script scores that same ARIMA(2,1,1) model.
 
 Outputs:
 - seven_day_backtest_results.csv
@@ -34,12 +33,9 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
 
-from src.regression import fit_line, predict_y
-
 DATE_COLUMNS = ("date", "production_date", "ds")
 EGG_COLUMNS = ("eggs", "eggs_produced", "y")
 EGGS_PER_TRAY = 30
-HISTORY_YEARS = 3
 ARIMA_ORDER = (2, 1, 1)
 HORIZON_DAYS = 7
 
@@ -131,75 +127,6 @@ def round_to_tray(value: float) -> int:
     return int(round(value / EGGS_PER_TRAY) * EGGS_PER_TRAY)
 
 
-def build_archive(history: list[tuple[datetime, float]]) -> dict[str, dict[str, float]]:
-    """Build the total-egg portion of service.py's normalized archive."""
-    return {
-        day.strftime("%Y-%m-%d"): {"eggs": float(eggs)}
-        for day, eggs in history
-        if eggs > 0
-    }
-
-
-def same_calendar_dated_samples(
-    archive: dict[str, dict[str, float]], target: datetime
-) -> list[tuple[datetime, dict[str, float]]]:
-    by_year: dict[int, tuple[datetime, dict[str, float]]] = {}
-    for key, row in archive.items():
-        day = datetime.strptime(key, "%Y-%m-%d")
-        if day >= target:
-            continue
-        if day.month == target.month and day.day == target.day:
-            by_year[day.year] = (day, dict(row))
-
-    if by_year:
-        years = sorted(by_year)[-HISTORY_YEARS:]
-        return [by_year[year] for year in years]
-
-    # Match service.py's nearby day-of-year fallback.
-    target_doy = target.timetuple().tm_yday
-    nearby: dict[int, list[dict[str, float]]] = {}
-    for key, row in archive.items():
-        day = datetime.strptime(key, "%Y-%m-%d")
-        if day >= target:
-            continue
-        if abs(day.timetuple().tm_yday - target_doy) > 3:
-            continue
-        nearby.setdefault(day.year, []).append(row)
-
-    by_year_fallback: dict[int, dict[str, float]] = {}
-    for year, year_rows in nearby.items():
-        by_year_fallback[year] = {
-            "eggs": sum(item["eggs"] for item in year_rows) / len(year_rows)
-        }
-    years = sorted(by_year_fallback, reverse=True)[:HISTORY_YEARS]
-    return [
-        (datetime(year, target.month, min(target.day, 28)), by_year_fallback[year])
-        for year in sorted(years)
-    ]
-
-
-def predict_three_year_day(
-    history: list[tuple[datetime, float]], target: datetime
-) -> float:
-    archive = build_archive(history)
-    dated_samples = same_calendar_dated_samples(archive, target)
-    if not dated_samples:
-        return 0.0
-
-    if len(dated_samples) == 1:
-        predicted = round_to_tray(dated_samples[0][1]["eggs"])
-        return float(predicted)
-
-    xs = [float(day.year) for day, _ in dated_samples]
-    ys = [float(row["eggs"]) for _, row in dated_samples]
-    slope, intercept = fit_line(xs, ys)
-    predicted = predict_y(slope, intercept, float(target.year))
-    predicted = round_to_tray(predicted)
-    if predicted <= 0:
-        predicted = round_to_tray(sum(ys) / len(ys))
-    return float(predicted)
-
-
 def predict_arima_seven_days(
     history: list[tuple[datetime, float]]
 ) -> list[float]:
@@ -256,11 +183,9 @@ def main(argv: list[str]) -> int:
 
     result_rows: list[tuple[str, str, float, float, int]] = []
     model_actuals: dict[str, list[float]] = {
-        "Three-Year Linear Regression": [],
         f"ARIMA{ARIMA_ORDER}": [],
     }
     model_predictions: dict[str, list[float]] = {
-        "Three-Year Linear Regression": [],
         f"ARIMA{ARIMA_ORDER}": [],
     }
     failed_blocks = {name: 0 for name in model_actuals}
@@ -278,15 +203,6 @@ def main(argv: list[str]) -> int:
         )
 
         # The seven target-day actuals are not included in origin_history.
-        three_year_predictions = [
-            predict_three_year_day(origin_history, target) for target in target_dates
-        ]
-        model_name = "Three-Year Linear Regression"
-        for target, actual, predicted in zip(target_dates, actuals, three_year_predictions):
-            model_actuals[model_name].append(actual)
-            model_predictions[model_name].append(predicted)
-            result_rows.append((model_name, target.strftime("%Y-%m-%d"), actual, predicted, block_number + 1))
-
         model_name = f"ARIMA{ARIMA_ORDER}"
         try:
             arima_predictions = predict_arima_seven_days(origin_history)
@@ -358,8 +274,8 @@ def main(argv: list[str]) -> int:
         "predicted using only records dated before that block starts."
     )
     print(
-        "Important: the Three-Year model follows the primary service.py total-egg "
-        "logic. Temperature-based egg-size allocation is not evaluated because "
+        "Important: this scores ARIMA(2,1,1) totals from src/service.py. "
+        "Temperature-based egg-size allocation is not evaluated because "
         "historical temperature data is not available in production.csv."
     )
     return 0
